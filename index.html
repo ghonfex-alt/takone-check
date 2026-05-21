@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>TakeOne Check</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#7c4dff">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="TakeOne Check">
+  <link rel="apple-touch-icon" href="icon.svg">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { font-family: -apple-system, 'Helvetica Neue', sans-serif; background: #111827; color: #f3f4f6; min-height: 100vh; }
+    input, button { font-family: inherit; }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+    .input { width: 100%; padding: 11px 14px; border-radius: 8px; border: 1px solid #374151; background: #111827; color: #f3f4f6; font-size: 16px; outline: none; }
+    .card { background: #1f2937; border-radius: 14px; padding: 18px; }
+    .sec-label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 12px; font-weight: 600; }
+    .overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.78); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 50; }
+    .modal { background: #1f2937; border-radius: 20px; padding: 28px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
+    .counter-wrap { display: flex; align-items: center; gap: 6px; }
+    .cbtn { width: 46px; height: 46px; border-radius: 8px; border: none; background: #374151; color: #fff; font-size: 24px; cursor: pointer; }
+    .cval { font-size: 24px; font-weight: 700; min-width: 38px; text-align: center; display: inline-block; }
+    .sticky-hdr { position: sticky; top: 0; background: #111827; z-index: 10; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; }
+  </style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// ── 定数 ──────────────────────────────────────────────────────────────────
+const LS = { STAFF: 'sh_staff', TABLES: 'sh_tables', SUMMARY: 'sh_summary' };
+const P = { TIME_BASE: 2000, TIME_EXT: 1000, SHISHA_NORMAL: 1500, SHISHA_INSTAGRAM: 500, ICE_HORSE: 500, ALCOHOL: 500, SHOT: 100, STAFF_DRINK: 700 };
+
+// ── ユーティリティ ─────────────────────────────────────────────────────────
+const fmt = n => '¥' + Number(n).toLocaleString();
+const hms = ms => {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  return [Math.floor(s/3600), Math.floor((s%3600)/60), s%60].map(v => String(v).padStart(2,'0')).join(':');
+};
+const fmtClock = ts => { const d = new Date(ts); return String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); };
+const esc = s => s == null ? '' : String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+
+// ── 料金計算 ───────────────────────────────────────────────────────────────
+function calcTimeCharge(checkInTime, now, guests) {
+  const mins = Math.max(0, Math.floor((now - checkInTime) / 60000));
+  return (P.TIME_BASE + Math.ceil(Math.max(0, mins - 69) / 30) * P.TIME_EXT) * (guests || 1);
+}
+function billingEnd(checkInTime, now) {
+  const mins = Math.max(0, Math.floor((now - checkInTime) / 60000));
+  const endMins = mins <= 69 ? 69 : 69 + Math.ceil((mins - 69) / 30) * 30;
+  return checkInTime + endMins * 60000;
+}
+function calcSubtotal(s, now) {
+  if (!s || !s.checkInTime) return 0;
+  let sub = calcTimeCharge(s.checkInTime, now, s.guests || 1);
+  if (s.shisha === 'normal') sub += P.SHISHA_NORMAL;
+  if (s.shisha === 'instagram') sub += P.SHISHA_INSTAGRAM;
+  if (s.iceHorse) sub += P.ICE_HORSE;
+  if (s.alcoholAdd) sub += P.ALCOHOL;
+  sub += (s.shots || 0) * P.SHOT;
+  Object.values(s.staffDrinks || {}).forEach(c => { sub += c * P.STAFF_DRINK; });
+  (s.bottles || []).forEach(b => { sub += b.price; });
+  return sub;
+}
+const calcTotal = (s, now) => Math.round(calcSubtotal(s, now) * 1.1);
+
+// ── 初期値 ────────────────────────────────────────────────────────────────
+const emptySession = () => ({ nickname:'', shishaInfo:'', checkInTime:null, guests:1, shisha:null, iceHorse:false, alcoholAdd:false, shots:0, staffDrinks:{}, bottles:[], checkedOut:false, totalAmount:null });
+const initTables = (n=8) => Array.from({length:n}, (_,i) => ({id:i+1, name:'T'+(i+1), session:null}));
+const initSummary = () => ({staffDrinks:{}, revenue:{cash:0,card:0}, bottles:[], totalGuests:0});
+
+// ── localStorage ──────────────────────────────────────────────────────────
+const lsGet = (k,d) => { try { return JSON.parse(localStorage.getItem(k)) || d; } catch { return d; } };
+const lsSet = (k,v) => localStorage.setItem(k, JSON.stringify(v));
+const loadSummary = () => {
+  const r = lsGet(LS.SUMMARY, null);
+  if (!r || (!r.staffDrinks && !r.revenue)) return initSummary();
+  return {staffDrinks:r.staffDrinks||{}, revenue:r.revenue||{cash:0,card:0}, bottles:r.bottles||[], totalGuests:r.totalGuests||0};
+};
+
+// ── アプリ状態 ─────────────────────────────────────────────────────────────
+const ST = {
+  screen: 'setup',
+  workingStaff: [],
+  tables: lsGet(LS.TABLES, null) || initTables(),
+  activeId: null,
+  showSummary: false,
+  payTableId: null,
+  showRename: false,
+  draftNames: {},
+  showCheckout: false,
+  bottleName: '',
+  bottlePrice: '',
+  staffInput: '',
+  allStaff: lsGet(LS.STAFF, ['スタッフA','スタッフB']),
+  selectedStaff: [],
+};
+
+let timerInterval = null;
+
+const activeTable = () => ST.tables.find(t => t.id === ST.activeId);
+const activeSession = () => { const t = activeTable(); return t ? t.session : null; };
+const updSession = patch => {
+  const t = activeTable();
+  if (!t) return;
+  const s = t.session || emptySession();
+  t.session = {...s, ...patch};
+  lsSet(LS.TABLES, ST.tables);
+};
+
+// ── レンダリング ──────────────────────────────────────────────────────────
+function render() {
+  clearInterval(timerInterval);
+  timerInterval = null;
+  const app = document.getElementById('app');
+  if (ST.screen === 'setup') {
+    app.innerHTML = renderSetup();
+  } else if (ST.screen === 'floor') {
+    app.innerHTML = renderFloor();
+    startFloorTimer();
+  } else if (ST.screen === 'table') {
+    app.innerHTML = renderTable();
+    startTableTimer();
+  }
+  if (ST.showSummary) app.insertAdjacentHTML('beforeend', renderSummary());
+}
+
+// ── スタッフ設定 ──────────────────────────────────────────────────────────
+function renderSetup() {
+  const btns = ST.allStaff.map(n => {
+    const sel = ST.selectedStaff.includes(n);
+    return `<button data-action="toggle-staff" data-name="${esc(n)}" style="padding:11px 18px;border-radius:10px;border:2px solid ${sel?'#7c4dff':'#374151'};background:${sel?'#4c1d95':'#374151'};color:#f3f4f6;font-size:16px;cursor:pointer;display:flex;align-items:center;gap:10px">
+      <span>${sel?'✓':'　'} ${esc(n)}</span>
+      <span data-action="del-staff" data-name="${esc(n)}" style="color:#6b7280;font-size:13px;padding:2px 4px">✕</span>
+    </button>`;
+  }).join('');
+  return `<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px">
+    <div style="background:#1f2937;border-radius:20px;padding:32px;width:100%;max-width:480px">
+      <div style="text-align:center;margin-bottom:32px">
+        <div style="font-size:52px;margin-bottom:10px">🍸</div>
+        <div style="font-size:26px;font-weight:800;color:#a78bfa">TakeOne Check</div>
+      </div>
+      <div class="sec-label">今日の出勤スタッフ</div>
+      <div style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:16px">${btns}</div>
+      <div style="display:flex;gap:8px;margin-bottom:28px">
+        <input id="inp-staff" class="input" value="${esc(ST.staffInput)}" placeholder="スタッフ名を追加..." />
+        <button data-action="add-staff" style="padding:9px 18px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:14px;cursor:pointer">追加</button>
+      </div>
+      <button data-action="start" style="width:100%;padding:20px;border-radius:14px;border:none;background:${ST.selectedStaff.length>0?'#7c4dff':'#374151'};color:#fff;font-size:19px;font-weight:800;cursor:${ST.selectedStaff.length>0?'pointer':'default'}">
+        営業開始${ST.selectedStaff.length>0?'（'+ST.selectedStaff.length+'名）':''}
+      </button>
+    </div>
+  </div>`;
+}
+
+// ── フロアビュー ──────────────────────────────────────────────────────────
+function renderFloor() {
+  const now = Date.now();
+  const cards = ST.tables.map(t => {
+    const s = t.session;
+    const occupied = s && s.checkInTime && !s.checkedOut;
+    const waiting = s && s.checkedOut;
+    const bc = waiting?'#f97316':occupied?'#22c55e':'#374151';
+    const sbg = waiting?'#7c2d12':occupied?'#14532d':'#374151';
+    const label = waiting?'会計待ち':occupied?'使用中':'空席';
+    const inner = occupied
+      ? `<span class="ft" data-id="${t.id}" style="font-size:19px;font-family:monospace;color:#4ade80">${hms(now-s.checkInTime)}</span>
+         <span class="fp" data-id="${t.id}" style="font-size:22px;font-weight:800;color:#c4b5fd">${fmt(calcTotal(s,now))}</span>`
+      : waiting && s.totalAmount!=null
+        ? `<span style="font-size:22px;font-weight:800;color:#fb923c">${fmt(s.totalAmount)}</span>`
+        : '';
+    return `<button data-action="select-table" data-id="${t.id}" style="background:#1f2937;border-radius:16px;padding:18px;cursor:pointer;text-align:center;display:flex;flex-direction:column;align-items:center;gap:8px;min-height:165px;color:#f3f4f6;border:2px solid ${bc};width:100%">
+      <span style="background:${sbg};color:${bc};border-radius:20px;padding:3px 12px;font-size:12px;font-weight:700">${label}</span>
+      <span style="font-size:36px;font-weight:800">${esc(t.name)}</span>
+      ${s&&s.nickname?`<span style="font-size:13px;color:#9ca3af">${esc(s.nickname)}</span>`:''}
+      ${inner}
+    </button>`;
+  }).join('');
+
+  const badges = ST.workingStaff.map(n=>`<span style="padding:4px 14px;border-radius:20px;background:#312e81;border:1px solid #4c1d95;font-size:13px;color:#a78bfa">${esc(n)}</span>`).join('');
+
+  return `<div style="min-height:100vh;padding:16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <div style="font-size:20px;font-weight:700">TakeOne Check</div>
+      <div style="display:flex;gap:8px">
+        <button data-action="open-rename" style="padding:9px 18px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:14px;cursor:pointer">⚙ テーブル</button>
+        <button data-action="show-summary" style="padding:9px 18px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:14px;cursor:pointer">日次集計</button>
+        <button data-action="end-day" style="padding:9px 18px;border-radius:8px;border:none;background:#1f2937;color:#fff;font-size:14px;cursor:pointer">終了</button>
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-bottom:18px;flex-wrap:wrap">${badges}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:14px">${cards}</div>
+    ${ST.showRename ? renderRenameModal() : ''}
+    ${ST.payTableId ? renderPayModal() : ''}
+  </div>`;
+}
+
+function startFloorTimer() {
+  timerInterval = setInterval(() => {
+    const now = Date.now();
+    ST.tables.forEach(t => {
+      const s = t.session;
+      if (!s||!s.checkInTime||s.checkedOut) return;
+      const te = document.querySelector('.ft[data-id="'+t.id+'"]');
+      const pe = document.querySelector('.fp[data-id="'+t.id+'"]');
+      if (te) te.textContent = hms(now-s.checkInTime);
+      if (pe) pe.textContent = fmt(calcTotal(s,now));
+    });
+  }, 1000);
+}
+
+function renderRenameModal() {
+  const rows = ST.tables.map(t =>
+    `<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <span style="font-size:14px;color:#6b7280;min-width:32px">#${t.id}</span>
+      <input class="input" style="flex:1" data-rename-id="${t.id}" value="${esc(ST.draftNames[t.id]||t.name)}" />
+    </div>`
+  ).join('');
+  return `<div class="overlay"><div class="modal" style="max-width:400px">
+    <div style="font-size:18px;font-weight:800;text-align:center;margin-bottom:20px;color:#a78bfa">テーブル名の編集</div>
+    ${rows}
+    <div style="display:flex;gap:10px;margin-top:20px">
+      <button data-action="close-rename" style="flex:1;padding:14px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:15px;cursor:pointer">キャンセル</button>
+      <button data-action="save-rename" style="flex:2;padding:14px;border-radius:8px;border:none;background:#7c4dff;color:#fff;font-size:15px;font-weight:800;cursor:pointer">保存</button>
+    </div>
+  </div></div>`;
+}
+
+function renderPayModal() {
+  const t = ST.tables.find(t=>t.id===ST.payTableId);
+  if (!t) return '';
+  const s = t.session;
+  return `<div class="overlay"><div class="modal" style="max-width:380px">
+    <div style="font-size:18px;font-weight:800;text-align:center;margin-bottom:6px;color:#a78bfa">${esc(t.name)}${s&&s.nickname?'（'+esc(s.nickname)+'）':''}</div>
+    <div style="font-size:13px;color:#6b7280;text-align:center;margin-bottom:20px">会計は済みましたか？</div>
+    <div style="font-size:36px;font-weight:800;text-align:center;color:#c4b5fd;margin-bottom:28px">${fmt(s&&s.totalAmount?s.totalAmount:0)}</div>
+    <div style="display:flex;gap:12px;margin-bottom:14px">
+      <button data-action="pay" data-method="cash" style="flex:1;padding:20px;border-radius:14px;border:none;background:#15803d;color:#fff;font-size:18px;font-weight:800;cursor:pointer">💴 現金</button>
+      <button data-action="pay" data-method="card" style="flex:1;padding:20px;border-radius:14px;border:none;background:#1d4ed8;color:#fff;font-size:18px;font-weight:800;cursor:pointer">💳 カード</button>
+    </div>
+    <button data-action="close-pay" style="width:100%;padding:14px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:15px;cursor:pointer">キャンセル</button>
+  </div></div>`;
+}
+
+// ── テーブル画面 ──────────────────────────────────────────────────────────
+function renderTable() {
+  const t = activeTable();
+  if (!t) return '';
+  const s = t.session || emptySession();
+  const now = Date.now();
+
+  const togBtn = (action, active, label, color) =>
+    `<button data-action="${action}" style="flex:1;padding:14px 8px;border-radius:10px;border:2px solid ${active?color:'#374151'};background:${active?color+'33':'#111827'};color:${active?'#fff':'#6b7280'};font-size:14px;font-weight:600;cursor:pointer;min-width:100px;line-height:1.4">${label}</button>`;
+
+  const timerSec = s.checkInTime
+    ? `<div style="text-align:center">
+        <div style="display:flex;justify-content:space-between;margin-bottom:10px;font-size:14px;color:#6b7280">
+          <span>入店 ${fmtClock(s.checkInTime)}</span>
+          <span id="billing-end">退店目安 ${fmtClock(billingEnd(s.checkInTime,now))}</span>
+        </div>
+        <div id="tt" style="font-size:48px;font-family:monospace;font-weight:800;color:#4ade80;letter-spacing:2px">${hms(now-s.checkInTime)}</div>
+        <div style="font-size:20px;color:#c4b5fd;margin-top:8px">
+          飲み放題: <span id="tc">${fmt(calcTimeCharge(s.checkInTime,now,s.guests||1))}</span>
+          <span style="font-size:14px;color:#6b7280"> ${s.guests||1}名</span>
+        </div>
+      </div>`
+    : `<button data-action="checkin" style="width:100%;padding:24px;border-radius:12px;border:none;background:#15803d;color:#fff;font-size:20px;font-weight:800;cursor:pointer">チェックイン（タイマー開始）</button>`;
+
+  const staffRows = ST.workingStaff.map(n => {
+    const c = (s.staffDrinks&&s.staffDrinks[n])||0;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+      <span style="font-size:17px;min-width:70px;font-weight:600">${esc(n)}</span>
+      <div class="counter-wrap">
+        <button class="cbtn" data-action="sd-dec" data-name="${esc(n)}">−</button>
+        <span class="cval">${c}</span>
+        <button class="cbtn" data-action="sd-inc" data-name="${esc(n)}">＋</button>
+      </div>
+      <span style="font-size:18px;color:#c4b5fd;font-weight:700;min-width:72px;text-align:right">${fmt(c*P.STAFF_DRINK)}</span>
+    </div>`;
+  }).join('');
+
+  const bottleList = (s.bottles||[]).map(b =>
+    `<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #1f2937">
+      <span style="font-size:15px">🍾 ${esc(b.name)}</span>
+      <div style="display:flex;gap:14px;align-items:center">
+        <span style="color:#c4b5fd;font-weight:700;font-size:16px">${fmt(b.price)}</span>
+        <button data-action="rm-bottle" data-bid="${b.id}" style="background:none;border:none;color:#6b7280;cursor:pointer;font-size:22px;line-height:1">×</button>
+      </div>
+    </div>`
+  ).join('');
+
+  return `<div style="min-height:100vh;padding-bottom:30px">
+    <div class="sticky-hdr">
+      <button data-action="back" style="padding:9px 18px;border-radius:8px;border:none;background:#1f2937;color:#fff;font-size:14px;cursor:pointer">← 戻る</button>
+      <span style="font-size:22px;font-weight:800">${esc(t.name)}</span>
+      <div style="width:72px"></div>
+    </div>
+    <div style="padding:16px;display:flex;flex-direction:column;gap:14px">
+
+      <div class="card">
+        <div class="sec-label">基本情報</div>
+        <input id="nn" class="input" value="${esc(s.nickname)}" placeholder="ニックネーム" />
+        <input id="si" class="input" style="margin-top:10px" value="${esc(s.shishaInfo)}" placeholder="シーシャ情報（フレーバーなど）" />
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+          <span class="sec-label" style="margin-bottom:0">人数</span>
+          <div class="counter-wrap">
+            <button class="cbtn" data-action="g-dec">−</button>
+            <span class="cval" id="gv">${s.guests||1}</span>
+            <button class="cbtn" data-action="g-inc">＋</button>
+          </div>
+        </div>
+        ${timerSec}
+      </div>
+
+      <div class="card">
+        <div class="sec-label">シーシャ</div>
+        <div style="display:flex;gap:10px;margin-bottom:10px">
+          ${togBtn('t-normal', s.shisha==='normal', '通常<br>¥1,500', '#7c4dff')}
+          ${togBtn('t-instagram', s.shisha==='instagram', 'Instagram<br>¥500', '#db2777')}
+        </div>
+        <div style="display:flex;gap:10px">
+          ${togBtn('t-ice', s.iceHorse, 'アイスホース<br>+¥500', '#0891b2')}
+          ${togBtn('t-alcohol', s.alcoholAdd, 'アルコール追加<br>+¥500', '#ea580c')}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="sec-label">ショットドリンク ¥100/杯</div>
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div class="counter-wrap">
+            <button class="cbtn" data-action="sh-dec">−</button>
+            <span class="cval" id="shv">${s.shots||0}</span>
+            <button class="cbtn" data-action="sh-inc">＋</button>
+          </div>
+          <span style="font-size:20px;color:#c4b5fd;font-weight:700" id="sht">${fmt((s.shots||0)*P.SHOT)}</span>
+        </div>
+      </div>
+
+      ${ST.workingStaff.length>0?`<div class="card">
+        <div class="sec-label">スタッフドリンク ¥700/杯</div>
+        ${staffRows}
+      </div>`:''}
+
+      <div class="card">
+        <div class="sec-label">ボトル・シャンパン</div>
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          ${[8000,15000,30000].map(p=>`<button data-action="b-preset" data-price="${p}" style="flex:1;padding:12px 4px;border-radius:10px;border:1px solid #374151;background:#111827;color:#f3f4f6;font-size:13px;cursor:pointer;font-weight:700">${fmt(p)}</button>`).join('')}
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:12px">
+          <input id="bn" class="input" style="flex:2" value="${esc(ST.bottleName)}" placeholder="品名" />
+          <input id="bp" class="input" style="flex:1" value="${esc(ST.bottlePrice)}" placeholder="金額" type="number" />
+          <button data-action="b-custom" style="padding:9px 18px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:14px;cursor:pointer">追加</button>
+        </div>
+        ${(s.bottles||[]).length>0?`<div style="border-top:1px solid #374151;padding-top:10px">${bottleList}</div>`:''}
+      </div>
+
+      <div style="background:#1e1b4b;border:2px solid #7c4dff;border-radius:14px;padding:18px 22px;display:flex;justify-content:space-between;align-items:center">
+        <span style="font-size:18px;color:#9ca3af">合計（税込）</span>
+        <span style="font-size:40px;font-weight:800;color:#c4b5fd" id="tot">${fmt(calcTotal(s,now))}</span>
+      </div>
+
+      ${s.checkInTime&&!s.checkedOut?`<button data-action="checkout" style="width:100%;padding:24px;border-radius:14px;border:none;background:#dc2626;color:#fff;font-size:22px;font-weight:800;cursor:pointer">会計</button>`:''}
+    </div>
+    ${ST.showCheckout ? renderCheckoutModal(s,now) : ''}
+  </div>`;
+}
+
+function startTableTimer() {
+  const t = activeTable();
+  if (!t||!t.session||!t.session.checkInTime||t.session.checkedOut) return;
+  timerInterval = setInterval(() => {
+    const now = Date.now();
+    const s = t.session;
+    const te=document.getElementById('tt'), ce=document.getElementById('tc'), toe=document.getElementById('tot'), ee=document.getElementById('billing-end');
+    if (te) te.textContent = hms(now-s.checkInTime);
+    if (ce) ce.textContent = fmt(calcTimeCharge(s.checkInTime,now,s.guests||1));
+    if (toe) toe.textContent = fmt(calcTotal(s,now));
+    if (ee) ee.textContent = '退店目安 '+fmtClock(billingEnd(s.checkInTime,now));
+  }, 1000);
+}
+
+function renderCheckoutModal(s, now) {
+  const sub = calcSubtotal(s,now);
+  const total = calcTotal(s,now);
+  const mins = Math.max(0,Math.floor((now-s.checkInTime)/60000));
+  const guests = s.guests||1;
+  const items = [{label:'飲み放題（'+mins+'分・'+guests+'名）', v:calcTimeCharge(s.checkInTime,now,guests)}];
+  if (s.shisha==='normal') items.push({label:'シーシャ（通常）',v:P.SHISHA_NORMAL});
+  if (s.shisha==='instagram') items.push({label:'シーシャ（Instagram）',v:P.SHISHA_INSTAGRAM});
+  if (s.iceHorse) items.push({label:'アイスホース',v:P.ICE_HORSE});
+  if (s.alcoholAdd) items.push({label:'アルコール追加',v:P.ALCOHOL});
+  if (s.shots>0) items.push({label:'ショット ×'+s.shots,v:s.shots*P.SHOT});
+  ST.workingStaff.forEach(n=>{const c=(s.staffDrinks&&s.staffDrinks[n])||0;if(c>0)items.push({label:n+' ドリンク ×'+c,v:c*P.STAFF_DRINK});});
+  (s.bottles||[]).forEach(b=>items.push({label:'🍾 '+b.name,v:b.price}));
+  const rows = items.map(i=>`<div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #374151;font-size:15px"><span style="color:#d1d5db">${esc(i.label)}</span><span>${fmt(i.v)}</span></div>`).join('');
+  return `<div class="overlay"><div class="modal">
+    <div style="font-size:20px;font-weight:800;text-align:center;margin-bottom:22px;color:#a78bfa">会計明細</div>
+    ${rows}
+    <div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #374151;font-size:15px;color:#9ca3af"><span>消費税（10%）</span><span>${fmt(Math.round(sub*0.1))}</span></div>
+    <div style="display:flex;justify-content:space-between;padding:16px 0 0;font-size:26px;font-weight:800;color:#c4b5fd"><span>合計</span><span>${fmt(total)}</span></div>
+    <div style="display:flex;gap:10px;margin-top:22px">
+      <button data-action="close-checkout" style="flex:1;padding:16px;border-radius:8px;border:none;background:#374151;color:#fff;font-size:16px;cursor:pointer">戻る</button>
+      <button data-action="do-checkout" style="flex:2;padding:16px;border-radius:8px;border:none;background:#7c4dff;color:#fff;font-size:16px;font-weight:800;cursor:pointer">会計完了</button>
+    </div>
+  </div></div>`;
+}
+
+// ── 日次集計 ──────────────────────────────────────────────────────────────
+function renderSummary() {
+  const sum = loadSummary();
+  const {staffDrinks,revenue,bottles=[],totalGuests=0} = sum;
+  const cash=revenue.cash||0, card=revenue.card||0, total=cash+card;
+  const td=ST.workingStaff.reduce((a,n)=>a+(staffDrinks[n]||0),0);
+  const tdb=Math.floor(td*P.STAFF_DRINK*0.1);
+  const tbob=bottles.reduce((a,b)=>a+Math.floor(b.price*0.1),0);
+  const srows=ST.workingStaff.map(n=>{const c=staffDrinks[n]||0;return`<div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #374151;font-size:15px"><span>${esc(n)}</span><span>${c}杯　${fmt(Math.floor(c*P.STAFF_DRINK*0.1))}</span></div>`;}).join('');
+  const brows=bottles.map(b=>`<div style="display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #374151;font-size:15px"><span>🍾 ${esc(b.name)}</span><span>${fmt(Math.floor(b.price*0.1))}</span></div>`).join('');
+  return `<div class="overlay"><div class="modal">
+    <div style="font-size:20px;font-weight:800;text-align:center;margin-bottom:24px;color:#a78bfa">本日の集計</div>
+    <div style="margin-bottom:22px">
+      <div class="sec-label">売上（支払済み）</div>
+      <div style="display:flex;align-items:baseline;gap:12px;margin-bottom:12px">
+        <div style="font-size:30px;font-weight:800;color:#4ade80">${fmt(total)}</div>
+        <div style="font-size:14px;color:#6b7280">来客 ${totalGuests}名</div>
+      </div>
+      <div style="display:flex;gap:10px">
+        <div style="flex:1;background:#14532d;border-radius:10px;padding:12px 14px"><div style="font-size:12px;color:#86efac;margin-bottom:4px">💴 現金</div><div style="font-size:20px;font-weight:800;color:#4ade80">${fmt(cash)}</div></div>
+        <div style="flex:1;background:#1e3a8a;border-radius:10px;padding:12px 14px"><div style="font-size:12px;color:#93c5fd;margin-bottom:4px">💳 カード</div><div style="font-size:20px;font-weight:800;color:#60a5fa">${fmt(card)}</div></div>
+      </div>
+    </div>
+    <div style="margin-bottom:22px">
+      <div class="sec-label">スタッフドリンクバック</div>
+      ${srows}
+      <div style="display:flex;justify-content:space-between;padding:12px 0 0;font-weight:800;font-size:15px"><span>合計</span><span>${td}杯　${fmt(tdb)}</span></div>
+    </div>
+    ${bottles.length>0?`<div><div class="sec-label">シャンパン・ボトルバック</div>${brows}<div style="display:flex;justify-content:space-between;padding:12px 0 0;font-weight:800;font-size:15px"><span>合計</span><span>${fmt(tbob)}</span></div></div>`:''}
+    <button data-action="close-summary" style="width:100%;padding:16px;border-radius:8px;border:none;background:#7c4dff;color:#fff;font-size:16px;font-weight:800;margin-top:26px;cursor:pointer">閉じる</button>
+  </div></div>`;
+}
+
+// ── イベントハンドラ ──────────────────────────────────────────────────────
+document.addEventListener('click', ev => {
+  const el = ev.target.closest('[data-action]');
+  if (!el) return;
+  ev.stopPropagation();
+  const a = el.dataset.action;
+
+  if (a === 'toggle-staff') { const n=el.dataset.name; ST.selectedStaff=ST.selectedStaff.includes(n)?ST.selectedStaff.filter(x=>x!==n):[...ST.selectedStaff,n]; render(); return; }
+  if (a === 'del-staff') { const n=el.dataset.name; ST.allStaff=ST.allStaff.filter(x=>x!==n); ST.selectedStaff=ST.selectedStaff.filter(x=>x!==n); lsSet(LS.STAFF,ST.allStaff); render(); return; }
+  if (a === 'add-staff') {
+    const inp=document.getElementById('inp-staff'); const n=(inp?inp.value:ST.staffInput).trim();
+    if (!n||ST.allStaff.includes(n)) return;
+    ST.allStaff=[...ST.allStaff,n]; ST.staffInput=''; lsSet(LS.STAFF,ST.allStaff); render(); return;
+  }
+  if (a === 'start') { if (!ST.selectedStaff.length) return; ST.workingStaff=[...ST.selectedStaff]; lsSet(LS.SUMMARY,initSummary()); ST.screen='floor'; render(); return; }
+
+  if (a === 'select-table') {
+    const id=Number(el.dataset.id); const tbl=ST.tables.find(t=>t.id===id);
+    if (tbl&&tbl.session&&tbl.session.checkedOut) { ST.payTableId=id; render(); return; }
+    ST.activeId=id; if (!tbl.session) { tbl.session=emptySession(); lsSet(LS.TABLES,ST.tables); }
+    ST.showCheckout=false; ST.bottleName=''; ST.bottlePrice=''; ST.screen='table'; render(); return;
+  }
+  if (a === 'open-rename') { const names={}; ST.tables.forEach(t=>{names[t.id]=t.name;}); ST.draftNames=names; ST.showRename=true; render(); return; }
+  if (a === 'close-rename') { ST.showRename=false; render(); return; }
+  if (a === 'save-rename') {
+    document.querySelectorAll('[data-rename-id]').forEach(inp=>{ST.draftNames[inp.dataset.renameId]=inp.value;});
+    Object.entries(ST.draftNames).forEach(([id,name])=>{ if(name.trim()) ST.tables=ST.tables.map(t=>t.id===Number(id)?{...t,name:name.trim()}:t); });
+    lsSet(LS.TABLES,ST.tables); ST.showRename=false; render(); return;
+  }
+  if (a === 'show-summary') { ST.showSummary=true; render(); return; }
+  if (a === 'close-summary') { ST.showSummary=false; render(); return; }
+  if (a === 'end-day') {
+    if (!confirm('営業を終了しますか？テーブルデータはリセットされます。')) return;
+    ST.tables=initTables(); localStorage.removeItem(LS.TABLES); localStorage.removeItem(LS.SUMMARY);
+    ST.screen='setup'; ST.selectedStaff=[]; ST.staffInput=''; render(); return;
+  }
+  if (a === 'pay') {
+    const method=el.dataset.method; const tbl=ST.tables.find(t=>t.id===ST.payTableId);
+    if (tbl&&tbl.session&&tbl.session.totalAmount) {
+      const sum=loadSummary(); sum.revenue[method]=(sum.revenue[method]||0)+tbl.session.totalAmount; lsSet(LS.SUMMARY,sum);
+      ST.tables=ST.tables.map(t=>t.id===ST.payTableId?{...t,session:null}:t); lsSet(LS.TABLES,ST.tables);
+    }
+    ST.payTableId=null; render(); return;
+  }
+  if (a === 'close-pay') { ST.payTableId=null; render(); return; }
+
+  if (a === 'back') { ST.screen='floor'; render(); return; }
+  if (a === 'checkin') { updSession({checkInTime:Date.now()}); render(); return; }
+  if (a === 'g-dec') { const s=activeSession(); updSession({guests:Math.max(1,(s?s.guests||1:1)-1)}); const e=document.getElementById('gv'); if(e)e.textContent=activeSession().guests; return; }
+  if (a === 'g-inc') { const s=activeSession(); updSession({guests:(s?s.guests||1:1)+1}); const e=document.getElementById('gv'); if(e)e.textContent=activeSession().guests; return; }
+  if (a === 't-normal') { const s=activeSession(); updSession({shisha:s&&s.shisha==='normal'?null:'normal'}); render(); return; }
+  if (a === 't-instagram') { const s=activeSession(); updSession({shisha:s&&s.shisha==='instagram'?null:'instagram'}); render(); return; }
+  if (a === 't-ice') { const s=activeSession(); updSession({iceHorse:s?!s.iceHorse:true}); render(); return; }
+  if (a === 't-alcohol') { const s=activeSession(); updSession({alcoholAdd:s?!s.alcoholAdd:true}); render(); return; }
+  if (a === 'sh-dec') { const s=activeSession(); updSession({shots:Math.max(0,(s?s.shots||0:0)-1)}); const sv=document.getElementById('shv'),st=document.getElementById('sht'); if(sv)sv.textContent=activeSession().shots; if(st)st.textContent=fmt(activeSession().shots*P.SHOT); return; }
+  if (a === 'sh-inc') { const s=activeSession(); updSession({shots:(s?s.shots||0:0)+1}); const sv=document.getElementById('shv'),st=document.getElementById('sht'); if(sv)sv.textContent=activeSession().shots; if(st)st.textContent=fmt(activeSession().shots*P.SHOT); return; }
+  if (a === 'sd-dec') { const n=el.dataset.name; const s=activeSession(); const c=(s&&s.staffDrinks&&s.staffDrinks[n])||0; updSession({staffDrinks:{...(s?s.staffDrinks:{}), [n]:Math.max(0,c-1)}}); render(); return; }
+  if (a === 'sd-inc') { const n=el.dataset.name; const s=activeSession(); const c=(s&&s.staffDrinks&&s.staffDrinks[n])||0; updSession({staffDrinks:{...(s?s.staffDrinks:{}), [n]:c+1}}); render(); return; }
+  if (a === 'b-preset') { const price=Number(el.dataset.price); const s=activeSession(); updSession({bottles:[...(s?s.bottles||[]:[]),{id:Date.now(),name:'シャンパン',price}]}); render(); return; }
+  if (a === 'b-custom') {
+    const bn=document.getElementById('bn'), bp=document.getElementById('bp');
+    const name=(bn?bn.value:ST.bottleName).trim()||'カスタム';
+    const price=parseInt(bp?bp.value:ST.bottlePrice,10);
+    if (!price||price<=0) return;
+    const s=activeSession(); updSession({bottles:[...(s?s.bottles||[]:[]),{id:Date.now(),name,price}]});
+    ST.bottleName=''; ST.bottlePrice=''; render(); return;
+  }
+  if (a === 'rm-bottle') { const bid=Number(el.dataset.bid); const s=activeSession(); updSession({bottles:(s?s.bottles||[]:[]).filter(b=>b.id!==bid)}); render(); return; }
+  if (a === 'checkout') { ST.showCheckout=true; render(); return; }
+  if (a === 'close-checkout') { ST.showCheckout=false; render(); return; }
+  if (a === 'do-checkout') {
+    const s=activeSession(); if (!s) return;
+    const now=Date.now(); const total=calcTotal(s,now);
+    const sum=loadSummary();
+    ST.workingStaff.forEach(n=>{sum.staffDrinks[n]=(sum.staffDrinks[n]||0)+((s.staffDrinks&&s.staffDrinks[n])||0);});
+    sum.bottles=[...(sum.bottles||[]),...(s.bottles||[])];
+    sum.totalGuests=(sum.totalGuests||0)+(s.guests||1);
+    lsSet(LS.SUMMARY,sum);
+    updSession({checkedOut:true,totalAmount:total});
+    ST.showCheckout=false; ST.screen='floor'; render(); return;
+  }
+});
+
+// テキスト入力はlocalStorageへ即時保存（再レンダリングせず）
+document.addEventListener('input', ev => {
+  const el=ev.target;
+  if (el.id==='inp-staff') { ST.staffInput=el.value; return; }
+  if (el.id==='nn') { const t=activeTable(); if(t&&t.session){t.session.nickname=el.value;lsSet(LS.TABLES,ST.tables);} return; }
+  if (el.id==='si') { const t=activeTable(); if(t&&t.session){t.session.shishaInfo=el.value;lsSet(LS.TABLES,ST.tables);} return; }
+  if (el.id==='bn') { ST.bottleName=el.value; return; }
+  if (el.id==='bp') { ST.bottlePrice=el.value; return; }
+  if (el.dataset.renameId) { ST.draftNames[el.dataset.renameId]=el.value; return; }
+});
+
+document.addEventListener('keydown', ev => {
+  if (ev.key==='Enter'&&ev.target.id==='inp-staff') {
+    const n=ev.target.value.trim();
+    if (!n||ST.allStaff.includes(n)) return;
+    ST.allStaff=[...ST.allStaff,n]; ST.staffInput=''; lsSet(LS.STAFF,ST.allStaff); render();
+  }
+});
+
+render();
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js');
+}
+</script>
+</body>
+</html>
